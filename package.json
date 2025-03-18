@@ -9,5 +9,12 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "dotenv": "^16.4.7",
+    "faiss-node": "^0.5.1",
+    "firebase": "^11.4.0",
+    "langchain": "^0.3.19"
+  }
 }
