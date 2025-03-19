@@ -44,6 +44,7 @@ async function loadFaissIndexesFromFirebase(collectionName) {
 
     for (const docSnap of querySnapshot.docs) {
         const data = docSnap.data();
+        console.log(data);
         const { indexURL, docstoreURL } = data;
 
         if (indexURL && docstoreURL) {
