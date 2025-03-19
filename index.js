@@ -1,13 +1,15 @@
 const {initializeApp} = require('firebase/app');
-const {getFireStore,collection,getDocs,doc, setDoc, updateDoc, getDoc} = require("firebase/firestore")
+const {getFirestore,collection,getDocs,doc, setDoc, updateDoc, getDoc} = require("firebase/firestore")
 const {getDatabase,ref,get} = require("firebase/database")
-const {GoogleGenerativeAi} = require("@google/generative-ai")
-const {FaissStore} = require("langchain/vectorstores/faiss")
-const  {GeminiProEmbeddings} = require("@langchain/google-genai");
+const {GoogleGenerativeAI} = require("@google/generative-ai")
+const { FaissStore } = require("@langchain/community/vectorstores/faiss");
+const  {GoogleGenerativeAIEmbeddings} = require("@langchain/google-genai");
 const { RecursiveCharacterTextSplitter } = require("langchain/text_splitter")
-const { loadQAStuffChain,RetrievalQAChain} = require("/langchain/chains")
+const { loadQAStuffChain,RetrievalQAChain} = require("langchain/chains")
 const { ChatGoogleGenerativeAI } = require("@langchain/google-genai")
 const fs = require("fs")
+const path = require("path");
+const { getStorage } = require('firebase/storage');
 require("dotenv").config()
 
 const firebaseConfig = {
@@ -16,124 +18,106 @@ const firebaseConfig = {
     databaseURL: process.env.databaseURL,
     projectId: process.env.projectId,
     storageBucket: process.env.storageBucket,
-    messagingSenderId: process.env.measurementId,
+    messagingSenderId: process.env.messagingSenderId,
     appId: process.env.appId,
     measurementId: process.env.measurementId
   };
 
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const genAI = new GoogleGenerativeAi(geminiApiKey);
+const geminiApiKey = process.env.GOOGLE_API_KEY ;
+console.log(geminiApiKey)
+const genAI = new GoogleGenerativeAI(geminiApiKey);
 const model = genAI.getGenerativeModel({model:"gemini-pro"});
-const embeddings = new GeminiProEmbeddings({
+const embeddings = new GoogleGenerativeAIEmbeddings({
     GoogleGenerativeAI: genAI
 })
 
 const app = initializeApp(firebaseConfig)
 const db = getDatabase(app)
+const firestore = getFirestore(app);
+const storage= getStorage(app)
 
 
-async function loadDataFromDatabase(path){
-    const dbRef = ref(db,path)
-    try {
-        const snapshot = await get(dbRef);
+async function loadFaissIndexesFromFirebase(collectionName) {
+    const collectionRef = collection(firestore, collectionName);
+    const querySnapshot = await getDocs(collectionRef);
+    const vectorStores = [];
 
-        if(snapshot.exists()){
-            const data = snapshot.val();
-            const documents = object.entries(data).map(([id,value])=>({id,...value}));
-            return documents;
-        }else{
-            console.log("no data found at the specified path")
-        }
-    } catch (error) {
-        
-    }
-}
-
-
-async function createEmbeddings(documents){
-    const textSplitter = new RecursiveCharacterTextSplitter({
-        chunkSize:1000, chunkOverlap:0
-    });
-
-    const texts = [];
-    const metadatas = [];
-    for(const doc of documents){
-        const splits = await textSplitter.splitText(doc.text);
-        texts.push(...splits);
-        for(let i=0;i<splits.length;i++){
-            metadatas.push({...doc.metadatas,doc_id:doc.id})
-        }
-    }
-    console.log("Creating vectorStore");
-    const vectorStore = await FaissStore.fromTexts(texts,metadatas, embeddings);
-    console.log("vectorStore created");
-    return vectorStore
-}
-
-async function storeFaissIndexToFireBase(index,collectionName,documentId){
-    const faissIndexBuffer = await index.serialize();
-    const docRef= doc(db,collectionName,documentId);
-    await setDoc(docRef,{
-        indexData: Array.from(new Uint8Array(faissIndexBuffer))
-    });
-    console.log("index stored at firestore")
-}
-
-
-async function loadFaissIndexFromFirebase(collectionName,documentId){
-    const docRef = doc(db,collectionName,documentId)
-    const docSnap = await getDoc(docRef);
-    if(docSnap.exists()){
+    for (const docSnap of querySnapshot.docs) {
         const data = docSnap.data();
-        const indexData = new Uint8Array(data.indexData);
-        const buffer = Buffer.from(indexData);
+        const { indexURL, docstoreURL } = data;
 
-        const dirPath = "./faiss_index";
+        if (indexURL && docstoreURL) {
+            const tempDir = `.faiss_temp_store/faiss_temp_${docSnap.id}`;
+            if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+            }
 
-        if(!fs.existsSync(dirPath)){
-            fs.mkdirSync(dirPath,{recursive: true})
+            const indexPath = path.join(tempDir, 'faiss.index');
+            const docstorePath = path.join(tempDir, 'docstore.json');
+
+            const indexResponse = await fetch(indexURL);
+            const indexBuffer = await indexResponse.arrayBuffer();
+            fs.writeFileSync(indexPath, Buffer.from(indexBuffer));
+
+            const docstoreResponse = await fetch(docstoreURL);
+            const docstoreBuffer = await docstoreResponse.arrayBuffer();
+            fs.writeFileSync(docstorePath, Buffer.from(docstoreBuffer));
+
+            const vectorStore = await FaissStore.load(tempDir, embeddings);
+            vectorStores.push(vectorStore);
         }
-        const indexPath = path.join(dirPath, 'faiss.index');
-        const ivfPath = path.join(dirPath,"faiss.ivf");
-        try {
-            fs.writeFileSync(indexPath,buffer);
-            fs.writeFileSync(ivfPath,'');
-            console.log("faiss index file created")
-        } catch (error) {
-            console.error("failed to create faiss file",error)
-            throw error;
-        }
-        const loadVectorStore = await FaissStore.load(dirPath,embeddings);
-        console.log("faiss index loaded from firebase");
-        return loadVectorStore;
-    }else{
-        console.log("No Faiss index found in Firebase");
-        return null
     }
+    if (vectorStores.length === 0) {
+        throw new Error("No valid FAISS indexes found in Firebase Storage.");
+    }
+
+
+    return {
+        asRetriever: () => ({
+            getRelevantDocuments: async (query) => {
+                const allResults = await Promise.all(
+                    vectorStores.map(vs => vs.asRetriever().getRelevantDocuments(query))
+                );
+                return allResults.flat();
+            }
+        })
+    };
 }
 
 async function answerQuestion(vectorStore, question) {
     const model = new ChatGoogleGenerativeAI({
         apiKey: geminiApiKey,
-        modelName: "gemini-pro",
-        tempertaure: 0.7
+        modelName: "gemini-2.0-flash",
+        temperature: 0.7
     })
 
-    const chain = RetrievalQAChain.fromLLM(model,vectorStore.asRetrieve());
+    const prompt = `
+                You are a helpful assistant. Please follow these rules when answering inquiries:
+                - If the message is an inquiry, answer it using only the provided information.
+                - If unsure about the answer to an inquiry, state that your knowledge is limited to the specific information provided by this business.
+                - If there are multiple inquiries in a message, answer them one by one.
+                - Refuse to tell jokes.
+                - Do not use names or sensitive data.
+                -first analysize the vector data being provided to you
+
+                Inquiry: ${question}
+            `;
+
+    const chain = RetrievalQAChain.fromLLM(
+        model,
+        vectorStore.asRetriever(),
+    );
     const res = await chain.call({
-        query: question
+        query: prompt
     })
     return res.text
 }
 
 async function runMain(question){
     try {
-        const documents = await loadDataFromDatabase("/")
-        const vectorStore = await createEmbeddings(documents);
+        
 
-        await storeFaissIndexToFireBase(vectorStore.index,'faiss_indexes','my-index-doc')
-
-        const loadedVectorStore = await loadFaissIndexFromFirebase('faiss_indexes','my_index_doc')
+        const loadedVectorStore = await loadFaissIndexesFromFirebase('faiss_indexes')
 
         if(loadedVectorStore){
             const answer = await answerQuestion(loadedVectorStore,question);
@@ -142,7 +126,7 @@ async function runMain(question){
             console.log("could not load the faiss index from firebase")
         }
     } catch (error) {
-        console.log.error("Error:",error)
+        console.error("Error:",error)
     }
 }
-runMain("hello there")
+runMain("Hello, I'm trying to pay our balance, but the pop up window does not allow me to add my CC information. Multiple people have tried multiple browsers and cards. Can you help? Becky Kolb WashU School of Medicine Marketing and Communications 618-806-6069")

@@ -12,9 +12,13 @@
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.0",
+    "@langchain/community": "^0.3.36",
+    "@langchain/google-genai": "^0.1.11",
     "dotenv": "^16.4.7",
     "faiss-node": "^0.5.1",
     "firebase": "^11.4.0",
+    "firebase-admin": "^12.7.0",
+    "he": "^1.2.0",
     "langchain": "^0.3.19"
   }
 }
